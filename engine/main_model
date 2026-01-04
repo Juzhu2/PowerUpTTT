@@ -1,0 +1,994 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum, unique
+from typing import Optional, Iterable
+import copy
+import random
+
+"""
+Tic-tac-toe TCG engine (board as sparse map).
+
+Key ideas:
+- Board is a bounded rectangle [min_x..max_x] x [min_y..max_y]
+- Cells are stored sparsely in a dict[Coord, Cell]. Missing => empty cell with no status.
+- "Void" cells (e.g., Annihilate) are tracked separately and are never playable.
+- You can evaluate:
+    (A) full-line "crossing" across the entire board extent (classic for n-in-a-row where n==board size)
+    (B) k-in-a-row lines anywhere on the board (k <= n), including diagonals.
+"""
+
+# -------------------- Constants --------------------
+INITIAL_HEALTH = 5
+
+INITIAL_HAND_SIZE = 3
+MAX_HAND_SIZE = 8
+
+INITIAL_DECK_SIZE = 10
+
+INITIAL_BOARD_SIZE = 3
+MAX_BOARD_SIZE = 10
+MAX_K = 10
+
+Coord = tuple[int, int]
+
+
+# -------------------- Enums --------------------
+@unique
+class Player(Enum):
+    X = "X"
+    O = "O"
+    NONE = None
+    BOTH = "B"
+
+    def other(self) -> "Player":
+        if self in (Player.NONE, Player.BOTH):
+            return self
+        return Player.X if self == Player.O else Player.O
+
+
+@unique
+class DamageMode(Enum):
+    CROSSING = "CROSSING"  # damage based on number of completed lines
+    PIECES = "PIECES"      # damage based on number of pieces that contributed
+    CUSTOM = "CUSTOM"
+
+
+@unique
+class Zone(str, Enum):
+    DECK = "DECK"
+    HAND = "HAND"
+    DISCARD = "DISCARD"
+    EXILE = "EXILE"
+
+
+@unique
+class Direction(Enum):
+    UP = (0, -1)
+    DOWN = (0, 1)
+    LEFT = (-1, 0)
+    RIGHT = (1, 0)
+
+    @property
+    def delta(self) -> tuple[int, int]:
+        return self.value
+
+
+# -------------------- Effects --------------------
+# effects on pieces
+@dataclass(frozen=True)
+class Burning:
+    turns_remaining: int
+
+
+@dataclass(frozen=True)
+class Shield:
+    turns_remaining: int
+    durability: int  # no more piece protection when hits 0
+
+
+# effects on cells
+@dataclass(frozen=True)
+class Frozen:
+    turns_remaining: int
+
+
+@dataclass(frozen=True)
+class Slippery:
+    triggers_remaining: int  # how many future placements can slip
+
+
+# effects on card
+@dataclass(frozen=True)
+class Discount:
+    discount: int
+    turns_remaining: int  # no more discount when hits 0
+
+
+@dataclass(frozen=True)
+class Curse:
+    turns_remaining: int  # discard card when hits 0
+
+
+Piece_Status = Burning | Shield
+Cell_Status = Frozen | Slippery
+Card_Status = Discount | Curse
+
+
+# -------------------- Core Models --------------------
+@dataclass
+class CardDef:
+    name: str
+    cost: int = 0
+
+
+@dataclass
+class Card:
+    color: Player
+    cost: int
+    status: list[Card_Status] = field(default_factory=list)
+
+
+@dataclass
+class Piece:
+    color: Player = Player.NONE
+    status: list[Piece_Status] = field(default_factory=list)
+
+    def copy_over(self, other: "Piece") -> None:
+        vars(self).update(vars(other))
+
+
+@dataclass
+class Cell:
+    piece: Optional[Piece] = None
+    status: list[Cell_Status] = field(default_factory=list)
+
+    def copy_over(self, other: "Cell") -> None:
+        vars(self).update(vars(other))
+
+
+@dataclass
+class Board:
+    min_x: int
+    max_x: int
+    min_y: int
+    max_y: int
+    cells: dict[Coord, Cell] = field(default_factory=dict)
+    void_cells: set[Coord] = field(default_factory=set)  # for cards like Annihilate
+
+    def __getitem__(self, c: Coord) -> Optional[Cell]:
+        return self.get_cell(c)
+
+    # --- geometry ---
+    @property
+    def width(self) -> int:
+        return self.max_x - self.min_x + 1
+
+    @property
+    def height(self) -> int:
+        return self.max_y - self.min_y + 1
+
+    def in_bounds(self, c: Coord) -> bool:
+        x, y = c
+        return self.min_x <= x <= self.max_x and self.min_y <= y <= self.max_y
+
+    def iter_coords(self) -> Iterable[Coord]:
+        for y in range(self.min_y, self.max_y + 1):
+            for x in range(self.min_x, self.max_x + 1):
+                yield (x, y)
+
+    # --- cell access ---
+    def is_void(self, c: Coord) -> bool:
+        return c in self.void_cells
+
+    def get_cell(self, c: Coord) -> Optional[Cell]:
+        return self.cells.get(c)
+
+    def ensure_cell(self, c: Coord) -> Cell:
+        """
+        Ensure a concrete Cell object exists at coord c (unless it's void).
+        This is used when we need to attach statuses to an otherwise-empty cell.
+        """
+        if self.is_void(c):
+            raise ValueError(f"Cannot ensure a void cell at {c}.")
+        if c not in self.cells:
+            self.cells[c] = Cell()
+        return self.cells[c]
+
+    def is_empty(self, c: Coord) -> bool:
+        if self.is_void(c):
+            return False
+        cell = self.get_cell(c)
+        return (cell is None) or (cell.piece is None)
+
+    # --- mutation ---
+    def place_piece(self, c: Coord, p: Piece) -> None:
+        cell = self.ensure_cell(c)
+        cell.piece = p
+
+    def remove_piece(self, c: Coord) -> None:
+        cell = self.get_cell(c)
+        if cell:
+            cell.piece = None
+
+    def remove_cell(self, c: Coord) -> None:
+        self.cells.pop(c, None)
+
+    def annihilate_cell(self, c: Coord) -> None:
+        """
+        Remove any piece/status info and mark the coord as permanently void/unplayable.
+        """
+        self.cells.pop(c, None)
+        self.void_cells.add(c)
+
+    def expand_from_corner(self, corner: str) -> None:
+        """
+        corner in {"TL","TR","BL","BR"}
+        Expand board by 1 in both axes from that corner.
+        """
+        if corner == "TL":
+            self.min_x -= 1
+            self.min_y -= 1
+        elif corner == "TR":
+            self.max_x += 1
+            self.min_y -= 1
+        elif corner == "BL":
+            self.min_x -= 1
+            self.max_y += 1
+        elif corner == "BR":
+            self.max_x += 1
+            self.max_y += 1
+        else:
+            raise ValueError(f"Unknown corner: {corner}")
+
+
+@dataclass
+class CardInstance:
+    id: str
+    owner: Player
+    definition: CardDef
+    zone: Zone = Zone.DECK
+
+
+@dataclass
+class PlayerState:
+    life: int = INITIAL_HEALTH
+    mana: int = 0
+    deck: list[str] = field(default_factory=list)
+    hand: list[str] = field(default_factory=list)
+    discard: list[str] = field(default_factory=list)
+    graveyard: list[str] = field(default_factory=list)
+    exile: list[str] = field(default_factory=list)
+
+
+@dataclass
+class Rules:
+    base_k: int = 3
+    max_mana: int = 10
+    one_card_per_turn: bool = True
+    one_piece_per_turn: bool = True
+    one_mana_increase_per_turn: bool = True
+    refresh_mana_each_turn: bool = True
+
+
+# -------------------- Game State --------------------
+class GameState:
+    def __init__(
+        self,
+        board_size: int = INITIAL_BOARD_SIZE,
+        deck_size: int = INITIAL_DECK_SIZE,
+        max_hand_size: int = MAX_HAND_SIZE,
+        max_board_size: int = MAX_BOARD_SIZE,
+        rules: Optional[Rules] = None,
+        *,
+        seed: Optional[int] = None,
+        rng: Optional[random.Random] = None,
+    ):
+        self.max_board_size = max_board_size
+        self.rules = rules or Rules(base_k=board_size)
+
+        # players
+        self.player: dict[Player, PlayerState] = {
+            Player.X: PlayerState(),
+            Player.O: PlayerState(),
+        }
+
+        # board
+        self.board = Board(0, board_size - 1, 0, board_size - 1)
+        self.current_player: Player = Player.X
+        self.turn_count = 0
+
+        # bookkeeping
+        self.deck_size = deck_size
+        self.max_hand_size = max_hand_size
+        self.contributions: dict[Player, list[list[Coord]]] = {Player.X: [], Player.O: []}
+        self.last_move: Optional[Coord] = None
+
+        # randomness (for effects like Banana Peel / Confuse)
+        self.rng: random.Random = rng or random.Random(seed)
+
+    # ---------------- player / turns ----------------
+    def switch_player(self) -> None:
+        self.current_player = self.current_player.other()
+
+    # ---------------- helpers ----------------
+    def _has_frozen(self, cell: Cell) -> bool:
+        return any(isinstance(s, Frozen) and s.turns_remaining > 0 for s in cell.status)
+
+    def _get_slippery(self, cell: Cell) -> Optional[Slippery]:
+        for s in cell.status:
+            if isinstance(s, Slippery) and s.triggers_remaining > 0:
+                return s
+        return None
+
+    def _decrement_slippery(self, cell: Cell) -> None:
+        new_status: list[Cell_Status] = []
+        for s in cell.status:
+            if isinstance(s, Slippery):
+                if s.triggers_remaining - 1 > 0:
+                    new_status.append(Slippery(triggers_remaining=s.triggers_remaining - 1))
+                # else: consume it
+            else:
+                new_status.append(s)
+        cell.status = new_status
+
+    def _neighbors4(self, c: Coord) -> list[Coord]:
+        x, y = c
+        return [(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)]
+
+    def valid_pos(self, c: Coord) -> bool:
+        """
+        A position is valid to place a piece iff:
+        - in bounds
+        - not void
+        - empty (no piece)
+        - not frozen (Frozen status with turns_remaining > 0)
+
+        Note: Slippery does NOT make a cell invalid; it alters placement resolution.
+        """
+        if not self.board.in_bounds(c):
+            return False
+        if self.board.is_void(c):
+            return False
+
+        cell = self.board.get_cell(c)
+        if cell is None:
+            return True  # empty & no statuses
+        if cell.piece is not None:
+            return False
+        if self._has_frozen(cell):
+            return False
+        return True
+
+    def _resolve_slip(self, target: Coord) -> Optional[Coord]:
+        """
+        Banana Peel logic:
+        - if target cell has Slippery(triggers_remaining>0), then the placement has 50% chance to slip
+        - if it slips: pick random 4-neighbor
+            - if out of bounds OR void OR occupied -> piece is destroyed (returns None)
+            - else returns the neighbor coord
+        - the slippery trigger is consumed on attempt (whether or not slip happens)
+        """
+        cell = self.board.get_cell(target)
+        if cell is None:
+            return target
+
+        slip = self._get_slippery(cell)
+        if slip is None:
+            return target
+
+        # consume one trigger regardless of outcome
+        self._decrement_slippery(cell)
+
+        if self.rng.random() >= 0.5:
+            return target  # no slip
+
+        # slip attempt
+        options = self._neighbors4(target)
+        dest = self.rng.choice(options)
+        if not self.board.in_bounds(dest):
+            return None
+        if self.board.is_void(dest):
+            return None
+        dest_cell = self.board.get_cell(dest)
+        if dest_cell is not None and dest_cell.piece is not None:
+            return None
+        # also respect frozen at destination
+        if dest_cell is not None and self._has_frozen(dest_cell):
+            return None
+        return dest
+
+    def iter_pieces(self) -> Iterable[tuple[Coord, Piece]]:
+        for c, cell in self.board.cells.items():
+            if cell.piece is not None:
+                yield c, cell.piece
+
+    # ---------------- core actions ----------------
+    def place_piece(self, color: Player, x: int, y: int) -> bool:
+        """
+        Place a piece. Returns True on success.
+        Banana Peel (Slippery) can cause the piece to slip or be destroyed.
+        """
+        start = (x, y)
+        if not self.valid_pos(start):
+            return False
+
+        dest = self._resolve_slip(start)
+        if dest is None:
+            # piece "falls off" or slips into invalid spot -> destroyed
+            self.last_move = None
+            return True  # the action resolved, even though no piece remains
+
+        self.board.place_piece(dest, Piece(color=color))
+        self.last_move = dest
+        return True
+
+    def remove_piece(self, x: int, y: int) -> bool:
+        c = (x, y)
+        cell = self.board.get_cell(c)
+        if cell is None or cell.piece is None:
+            return False
+        self.board.remove_piece(c)
+        return True
+
+    def nullify_cell(self, x: int, y: int) -> bool:
+        c = (x, y)
+        if not self.board.in_bounds(c):
+            return False
+        self.board.annihilate_cell(c)
+        return True
+
+    def freeze_cell(self, x: int, y: int, turns: int) -> bool:
+        if turns <= 0:
+            return False
+        c = (x, y)
+        if not self.board.in_bounds(c) or self.board.is_void(c):
+            return False
+        cell = self.board.ensure_cell(c)
+        # replace existing Frozen with new duration (simple policy)
+        cell.status = [s for s in cell.status if not isinstance(s, Frozen)]
+        cell.status.append(Frozen(turns_remaining=turns))
+        return True
+
+    def burn_piece(self, x: int, y: int, turns: int) -> bool:
+        """
+        Set the piece on fire (Burning status). Requires a piece to exist.
+        """
+        if turns <= 0:
+            return False
+        c = (x, y)
+        cell = self.board.get_cell(c)
+        if cell is None or cell.piece is None:
+            return False
+        # replace existing Burning with new duration (simple policy)
+        cell.piece.status = [s for s in cell.piece.status if not isinstance(s, Burning)]
+        cell.piece.status.append(Burning(turns_remaining=turns))
+        return True
+
+    def add_banana_peel(self, x: int, y: int, triggers: int = 1) -> bool:
+        """
+        Banana Peel: choose a cell; next `triggers` placements on this cell have a 50% chance to slip.
+        """
+        if triggers <= 0:
+            return False
+        c = (x, y)
+        if not self.board.in_bounds(c) or self.board.is_void(c):
+            return False
+        cell = self.board.ensure_cell(c)
+        # merge with existing slippery
+        existing = self._get_slippery(cell)
+        cell.status = [s for s in cell.status if not isinstance(s, Slippery)]
+        new_triggers = triggers + (existing.triggers_remaining if existing else 0)
+        cell.status.append(Slippery(triggers_remaining=new_triggers))
+        return True
+
+    def expand_from_corner(self, corner: str) -> bool:
+        """
+        Expand board by 1 in both axes from that corner, respecting max_board_size.
+        Returns True if expansion happened.
+        """
+        # simulate new bounds
+        min_x, max_x, min_y, max_y = self.board.min_x, self.board.max_x, self.board.min_y, self.board.max_y
+        if corner == "TL":
+            min_x -= 1; min_y -= 1
+        elif corner == "TR":
+            max_x += 1; min_y -= 1
+        elif corner == "BL":
+            min_x -= 1; max_y += 1
+        elif corner == "BR":
+            max_x += 1; max_y += 1
+        else:
+            raise ValueError(f"Unknown corner: {corner}")
+
+        new_w = max_x - min_x + 1
+        new_h = max_y - min_y + 1
+        if new_w > self.max_board_size or new_h > self.max_board_size:
+            return False
+
+        self.board.expand_from_corner(corner)
+        # Keep base_k <= board size
+        self.rules.base_k = min(self.rules.base_k, self.board.width, self.board.height)
+        return True
+
+    # ---------------- card-like board effects ----------------
+    def black_hole(self) -> None:
+        """Black Hole: destroy all pieces."""
+        for cell in self.board.cells.values():
+            cell.piece = None
+
+    def confuse(self) -> None:
+        """Confuse: for each piece, randomly assign a player to it (X or O)."""
+        for _, piece in self.iter_pieces():
+            piece.color = Player.X if self.rng.random() < 0.5 else Player.O
+
+    def slice_row(self, y: int) -> bool:
+        """Slice: destroy all pieces in a chosen row."""
+        if not (self.board.min_y <= y <= self.board.max_y):
+            return False
+        for x in range(self.board.min_x, self.board.max_x + 1):
+            c = (x, y)
+            if self.board.is_void(c):
+                continue
+            self.board.remove_piece(c)
+        return True
+
+    def slice_col(self, x: int) -> bool:
+        """Slice: destroy all pieces in a chosen column."""
+        if not (self.board.min_x <= x <= self.board.max_x):
+            return False
+        for y in range(self.board.min_y, self.board.max_y + 1):
+            c = (x, y)
+            if self.board.is_void(c):
+                continue
+            self.board.remove_piece(c)
+        return True
+
+    def slice_diag_main(self, offset: int = 0) -> bool:
+        """
+        Slice: destroy all pieces on a main-slope diagonal defined by (y - x == offset).
+        Works for any offset; for an n x n board with min==0, main diagonal offset is 0.
+        """
+        hit = False
+        for x in range(self.board.min_x, self.board.max_x + 1):
+            y = x + offset
+            c = (x, y)
+            if not self.board.in_bounds(c) or self.board.is_void(c):
+                continue
+            self.board.remove_piece(c)
+            hit = True
+        return hit
+
+    def slice_diag_anti(self, s: int) -> bool:
+        """
+        Slice: destroy all pieces on an anti-slope diagonal defined by (x + y == s).
+        For an n x n board with min==0, anti-diagonal has s == n-1.
+        """
+        hit = False
+        for x in range(self.board.min_x, self.board.max_x + 1):
+            y = s - x
+            c = (x, y)
+            if not self.board.in_bounds(c) or self.board.is_void(c):
+                continue
+            self.board.remove_piece(c)
+            hit = True
+        return hit
+
+    def shift_pieces(self, direction: Direction) -> None:
+        """
+        Shift: choose a direction; all pieces shift simultaneously.
+        Any that go out of bounds OR into void are destroyed.
+        If multiple pieces would collide (shouldn't happen for uniform shift), later ones are dropped.
+        """
+        dx, dy = direction.delta
+        new_cells: dict[Coord, Cell] = {}
+
+        # Copy over existing non-piece cell statuses first (they stay attached to coords)
+        for c, cell in self.board.cells.items():
+            if cell.status:
+                # only carry status; piece will be re-set below
+                new_cells[c] = Cell(piece=None, status=copy.deepcopy(cell.status))
+
+        # Move pieces
+        for (x, y), piece in list(self.iter_pieces()):
+            dest = (x + dx, y + dy)
+            if not self.board.in_bounds(dest):
+                continue
+            if self.board.is_void(dest):
+                continue
+            # if destination is frozen, treat it as "occupied by effect" => destroy
+            dest_cell_existing = self.board.get_cell(dest)
+            if dest_cell_existing is not None and self._has_frozen(dest_cell_existing):
+                continue
+
+            cell = new_cells.get(dest)
+            if cell is None:
+                cell = Cell()
+                new_cells[dest] = cell
+            # collision: if already a piece, drop this one
+            if cell.piece is None:
+                cell.piece = copy.deepcopy(piece)
+
+        self.board.cells = new_cells
+        self.last_move = None  # many moves changed
+
+    def collapse(self, x: int, y: int) -> bool:
+        """
+        Collapse: Choose a cell (x,y). Destroy all CELLS in its row and column.
+        Then merge the remaining board by removing that row and column and shifting
+        everything beyond them inward (board shrinks by 1 in each axis).
+        """
+        pivot = (x, y)
+        if not self.board.in_bounds(pivot):
+            return False
+
+        col = x
+        row = y
+
+        # Build new structures by shifting coords that survive
+        new_cells: dict[Coord, Cell] = {}
+        new_void: set[Coord] = set()
+
+        for c, cell in self.board.cells.items():
+            cx, cy = c
+            if cx == col or cy == row:
+                continue  # destroyed cell
+            nx = cx - 1 if cx > col else cx
+            ny = cy - 1 if cy > row else cy
+            new_cells[(nx, ny)] = copy.deepcopy(cell)
+
+        for c in self.board.void_cells:
+            cx, cy = c
+            if cx == col or cy == row:
+                continue
+            nx = cx - 1 if cx > col else cx
+            ny = cy - 1 if cy > row else cy
+            new_void.add((nx, ny))
+
+        # Update bounds (shrink by 1)
+        self.board.max_x -= 1
+        self.board.max_y -= 1
+        self.board.cells = new_cells
+        self.board.void_cells = new_void
+
+        # Clamp base_k
+        self.rules.base_k = min(self.rules.base_k, self.board.width, self.board.height)
+        self.last_move = None
+        return True
+
+    # ---------------- win / crossing logic ----------------
+    def check_crossing_full_lines(self) -> Player:
+        """
+        Full-line "crossing" across the entire board extent.
+        - Requires every coord on the line to be occupied (void/empty breaks the line).
+        - Checks all rows, columns, and the two main diagonals (board is assumed square).
+        Populates self.contributions[player] with lists of coords contributing.
+        """
+        self.contributions = {Player.X: [], Player.O: []}
+
+        cols = range(self.board.min_x, self.board.max_x + 1)
+        rows = range(self.board.min_y, self.board.max_y + 1)
+
+        def evaluate_line(coords: list[Coord]) -> None:
+            colors: list[Player] = []
+            for c in coords:
+                if self.board.is_void(c):
+                    return
+                cell = self.board.get_cell(c)
+                if cell and cell.piece:
+                    colors.append(cell.piece.color)
+                else:
+                    return  # Incomplete line
+            if all(col == Player.X for col in colors):
+                self.contributions[Player.X].append(coords)
+            elif all(col == Player.O for col in colors):
+                self.contributions[Player.O].append(coords)
+
+        # Rows
+        for y in rows:
+            evaluate_line([(x, y) for x in cols])
+
+        # Columns
+        for x in cols:
+            evaluate_line([(x, y) for y in rows])
+
+        # Main diagonals (board is square by design; void can "break" them)
+        if self.board.width == self.board.height:
+            n = self.board.width
+            evaluate_line([(self.board.min_x + i, self.board.min_y + i) for i in range(n)])
+            evaluate_line([(self.board.max_x - i, self.board.min_y + i) for i in range(n)])
+
+        has_x = len(self.contributions[Player.X]) > 0
+        has_o = len(self.contributions[Player.O]) > 0
+        if has_x and has_o:
+            return Player.BOTH
+        if has_x:
+            return Player.X
+        if has_o:
+            return Player.O
+        return Player.NONE
+
+    def check_k_crossings(self, k: Optional[int] = None) -> Player:
+        """
+        General k-in-a-row check for an n x n board where n may be > k.
+        Finds ANY contiguous segment of length k along:
+        - horizontal
+        - vertical
+        - diagonal (\)
+        - anti-diagonal (/)
+
+        Void or empty cells break continuity.
+
+        Populates self.contributions[player] with each found segment (as coord list).
+        """
+        k = k or self.rules.base_k
+        if k <= 0:
+            raise ValueError("k must be positive")
+        if k > max(self.board.width, self.board.height):
+            self.contributions = {Player.X: [], Player.O: []}
+            return Player.NONE
+
+        self.contributions = {Player.X: [], Player.O: []}
+
+        directions = [(1, 0), (0, 1), (1, 1), (1, -1)]
+
+        def color_at(c: Coord) -> Optional[Player]:
+            if self.board.is_void(c):
+                return None
+            cell = self.board.get_cell(c)
+            if cell is None or cell.piece is None:
+                return None
+            return cell.piece.color if cell.piece.color in (Player.X, Player.O) else None
+
+        for c, piece in self.iter_pieces():
+            color = piece.color
+            if color not in (Player.X, Player.O):
+                continue
+
+            x, y = c
+            for dx, dy in directions:
+                # Only start a run if previous cell in this direction is NOT same color (avoid duplicates)
+                prev = (x - dx, y - dy)
+                if self.board.in_bounds(prev) and color_at(prev) == color:
+                    continue
+
+                # attempt to collect k cells
+                coords: list[Coord] = [c]
+                ok = True
+                cx, cy = x, y
+                for _ in range(k - 1):
+                    cx += dx
+                    cy += dy
+                    nc = (cx, cy)
+                    if not self.board.in_bounds(nc) or color_at(nc) != color:
+                        ok = False
+                        break
+                    coords.append(nc)
+
+                if ok:
+                    self.contributions[color].append(coords)
+
+        has_x = len(self.contributions[Player.X]) > 0
+        has_o = len(self.contributions[Player.O]) > 0
+        if has_x and has_o:
+            return Player.BOTH
+        if has_x:
+            return Player.X
+        if has_o:
+            return Player.O
+        return Player.NONE
+
+    def after_crossings(
+        self,
+        damage_mode: DamageMode = DamageMode.CROSSING,
+        clear: bool = True,
+    ) -> bool:
+        """
+        Precondition: call check_crossing_full_lines() or check_k_crossings() first.
+
+        Applies damage to the *other* player based on contributions, and optionally
+        clears all contributing pieces.
+        """
+        x_cells: set[Coord] = {c for line in self.contributions[Player.X] for c in line}
+        o_cells: set[Coord] = {c for line in self.contributions[Player.O] for c in line}
+
+        if not x_cells and not o_cells:
+            return False
+
+        if clear:
+            for c in (x_cells | o_cells):
+                self.board.remove_piece(c)
+
+        if damage_mode == DamageMode.CROSSING:
+            self.player[Player.X].life -= len(self.contributions[Player.O])
+            self.player[Player.O].life -= len(self.contributions[Player.X])
+        elif damage_mode == DamageMode.PIECES:
+            self.player[Player.X].life -= len(o_cells)
+            self.player[Player.O].life -= len(x_cells)
+        else:
+            raise NotImplementedError("CUSTOM damage mode not implemented yet.")
+
+        return True
+
+    def check_win(self) -> Player:
+        """
+        Win condition is currently based on life totals (after damage).
+        """
+        pX_h = self.player[Player.X].life
+        pO_h = self.player[Player.O].life
+        if pX_h <= 0 or pO_h <= 0:
+            if pX_h == pO_h:
+                return Player.BOTH
+            return Player.X if pX_h > pO_h else Player.O
+        return Player.NONE
+
+    # ---------------- optional: fast last-move check ----------------
+    def check_k_from(self, origin: Coord, k: Optional[int] = None) -> Player:
+        """
+        Fast check: determine whether there's a k-in-a-row line passing through origin,
+        looking only along the 4 tic-tac-toe directions.
+        """
+        cell = self.board.get_cell(origin)
+        if cell is None or cell.piece is None:
+            return Player.NONE
+        color = cell.piece.color
+        if color not in (Player.X, Player.O):
+            return Player.NONE
+
+        k = k or self.rules.base_k
+        directions = [(1, 0), (0, 1), (1, 1), (1, -1)]
+
+        def same_color(c: Coord) -> bool:
+            if not self.board.in_bounds(c) or self.board.is_void(c):
+                return False
+            cc = self.board.get_cell(c)
+            return cc is not None and cc.piece is not None and cc.piece.color == color
+
+        def count_dir(dx: int, dy: int) -> int:
+            cnt = 0
+            x, y = origin
+            # forward
+            nx, ny = x + dx, y + dy
+            while same_color((nx, ny)):
+                cnt += 1
+                nx += dx
+                ny += dy
+            # backward
+            nx, ny = x - dx, y - dy
+            while same_color((nx, ny)):
+                cnt += 1
+                nx -= dx
+                ny -= dy
+            return cnt
+
+        for dx, dy in directions:
+            if 1 + count_dir(dx, dy) >= k:
+                return color
+        return Player.NONE
+
+    # ---------------- debug / printing ----------------
+    def fill(self, direction: Coord, start: Coord, color: Player, length: Optional[int] = None, *, overwrite: bool = True) -> None:
+        """
+        Debug helper: place a contiguous line of pieces.
+        By default, overwrites existing pieces (useful for test setups).
+        """
+        dx, dy = direction
+        n = length if length is not None else self.rules.base_k
+        x0, y0 = start
+        for i in range(n):
+            c = (x0 + i * dx, y0 + i * dy)
+            if not self.board.in_bounds(c) or self.board.is_void(c):
+                continue
+            if overwrite:
+                cell = self.board.ensure_cell(c)
+                cell.piece = Piece(color=color)
+            else:
+                self.place_piece(color, c[0], c[1])
+
+    def str_board(self) -> str:
+        """
+        Debug view of the board.
+
+        Legend:
+        ⬛ = void cell (removed from the game)
+        ⬜ = empty cell
+        🧊 = frozen cell (cannot be played into while active)
+        🍌 = banana peel / slippery cell (may cause slip on placement)
+        ❌/⭕ = occupied by that player
+        """
+        def has_frozen(cell: Cell) -> bool:
+            return any(isinstance(s, Frozen) and s.turns_remaining > 0 for s in cell.status)
+
+        def has_banana(cell: Cell) -> bool:
+            return any(isinstance(s, Slippery) and s.triggers_remaining > 0 for s in cell.status)
+
+        def cell_to_char(c: Coord) -> str:
+            if self.board.is_void(c):
+                return "⬛"
+
+            cell = self.board.get_cell(c)
+            if cell is None:
+                return "⬜"
+
+            if cell.piece is not None:
+                if cell.piece.color == Player.X:
+                    return "❌"
+                if cell.piece.color == Player.O:
+                    return "⭕"
+                return "⬜"
+
+            # empty but statusful
+            if has_frozen(cell) and has_banana(cell):
+                # keep it single-token; prioritize frozen visually
+                return "🧊"
+            if has_frozen(cell):
+                return "🧊"
+            if has_banana(cell):
+                return "🍌"
+            return "⬜"
+
+        header = f"X life: {self.player[Player.X].life} | O life: {self.player[Player.O].life}\n"
+        s = header
+        for y in range(self.board.min_y, self.board.max_y + 1):
+            row = []
+            for x in range(self.board.min_x, self.board.max_x + 1):
+                row.append(cell_to_char((x, y)))
+            s += " ".join(row) + "\n"
+        return s
+
+
+    def snapshot(self) -> "GameState":
+        return copy.deepcopy(self)
+
+
+def main() -> int:
+    # Quick sanity tests
+    s = GameState(board_size=5, seed=123)
+
+    # Banana peel
+    s.add_banana_peel(2, 2)
+    s.place_piece(Player.X, 2, 2)  # may slip
+    print("After banana peel placement:")
+    print(s.str_board())
+
+    # Confuse
+    s.fill((1, 0), (0, 0), Player.O, length=3)
+    s.confuse()
+    print("After confuse:")
+    print(s.str_board())
+
+    # Shift
+    s.shift_pieces(Direction.RIGHT)
+    print("After shift right:")
+    print(s.str_board())
+
+    # k-crossings
+    s = GameState(board_size=5)
+    s.fill((1, 0), (0, 1), Player.X, length=3)
+    s.fill((0, 1), (4, 0), Player.O, length=3)
+    print("k=3 crossings winner:", s.check_k_crossings(k=3))
+    print("contrib:", s.contributions)
+    print(s.str_board())
+
+    # Collapse
+    s.collapse(3,3)
+    print("After Collapse")
+    print(s.str_board())
+
+    #Black Hole
+    s.black_hole()
+    print("After Black Hole")
+    print(s.str_board())
+
+    #Void
+    s.nullify_cell(2,1)
+    s.add_banana_peel(2,2)
+    s.freeze_cell(3,3,2)
+    print("After Annihilate, Banana, Frozen")
+    print(s.str_board())
+
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
